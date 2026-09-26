@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bps-proxy"
+version = "0.1.0"
+description = "Local Responses proxy for the ChatGPT Excel backend"
+requires-python = ">=3.9"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{name = "kokojacket"}]
+keywords = ["responses-api", "proxy", "codex"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+]
+
+[project.urls]
+Homepage = "https://github.com/kokojacket/openai-proxy"
+Repository = "https://github.com/kokojacket/openai-proxy"
+Issues = "https://github.com/kokojacket/openai-proxy/issues"
+
+[project.scripts]
+bps-proxy = "bps_proxy.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["bps_proxy*"]

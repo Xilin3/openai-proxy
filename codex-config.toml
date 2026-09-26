@@ -1,0 +1,10 @@
+# 把下面两段贴进 ~/.codex/config.toml
+# model_provider 放在文件顶层，不要放进别的 [table] 里面。
+# 改完重新开一次对话。代理要先启动，默认端口 8787。
+
+model_provider = "bps"
+
+[model_providers.bps]
+name = "Basispoints"
+base_url = "http://127.0.0.1:8787/v1"
+wire_api = "responses"
