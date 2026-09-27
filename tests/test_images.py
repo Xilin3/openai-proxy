@@ -160,7 +160,7 @@ class ImageTests(unittest.TestCase):
         handler = Handler.__new__(Handler)
         handler.server = SimpleNamespace(memory=CallMemory(), pictures=self.images)
         requests = []
-        def upstream(_session, body):
+        def upstream(_session, body, **_kwargs):
             requests.append(body)
             if len(requests) == 1:
                 raise UpstreamError(422, 'invalid body')
@@ -207,7 +207,7 @@ class ImageTests(unittest.TestCase):
 class TerminalTests(unittest.TestCase):
     def test_text_delta_is_delivered_before_upstream_continues(self):
         consumed = []
-        def upstream(*_):
+        def upstream(*_, **_kwargs):
             consumed.append('start')
             yield 'response.output_text.delta', {'type': 'response.output_text.delta', 'output_index': 0, 'delta': 'hello'}
             consumed.append('finish')

@@ -1,4 +1,5 @@
 import io
+import sys
 import unittest
 from unittest.mock import patch
 
@@ -9,13 +10,17 @@ class CliTest(unittest.TestCase):
     def test_invalid_admission_options_fail_before_state(self):
         for args in (['--max-concurrent', '0'], ['--max-pending', '-1'],
                      ['--queue-timeout', 'nan'], ['--queue-timeout', '0'],
-                     ['--upstream-rps', '0'], ['--upstream-rps', '-1']):
+                     ['--upstream-rps', '0'], ['--upstream-rps', '-1'],
+                     ['--max-sse-event-mib', '0'], ['--max-sse-event-mib', '-1'],
+                     ['--max-sse-event-mib', '1.5'], ['--max-sse-event-mib', str(sys.maxsize)]):
             with self.subTest(args=args), patch('sys.argv', ['bps-proxy', *args]), patch(
-                    'sys.stderr', new_callable=io.StringIO), patch('bps_proxy.__main__.CallMemory') as memory:
+                    'sys.stderr', new_callable=io.StringIO), patch('bps_proxy.__main__.CallMemory') as memory, patch(
+                    'bps_proxy.__main__.serve') as serve:
                 with self.assertRaises(SystemExit) as raised:
                     main()
                 self.assertEqual(raised.exception.code, 2)
                 memory.assert_not_called()
+                serve.assert_not_called()
 
     def test_invalid_bind_arguments_fail_before_loading_state(self):
         for args in (["--host", "0.0.0.0"], ["--port", "0"], ["--port", "65536"]):
@@ -29,10 +34,10 @@ class CliTest(unittest.TestCase):
                 serve.assert_not_called()
 
     def test_default_and_explicit_request_limits_reach_server(self):
-        cases = [([], dict(max_concurrent=8, max_pending=32, queue_timeout=120, upstream_rps=5)),
+        cases = [([], dict(max_concurrent=8, max_pending=32, queue_timeout=120, upstream_rps=5, max_sse_event_bytes=16 * 1024 * 1024)),
                  (['--max-concurrent', '3', '--max-pending', '4', '--queue-timeout', '7',
-                   '--upstream-rps', '2'],
-                  dict(max_concurrent=3, max_pending=4, queue_timeout=7, upstream_rps=2))]
+                   '--upstream-rps', '2', '--max-sse-event-mib', '32'],
+                  dict(max_concurrent=3, max_pending=4, queue_timeout=7, upstream_rps=2, max_sse_event_bytes=32 * 1024 * 1024))]
         for args, expected in cases:
             with self.subTest(args=args), patch('sys.argv', ['bps-proxy', *args]), patch(
                     'sys.stdout', new_callable=io.StringIO), patch('bps_proxy.__main__.CallMemory'), patch(

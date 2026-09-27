@@ -111,7 +111,7 @@ class RateLimitRelayTest(unittest.TestCase):
         order = []
         handler.server.upstream_rate.acquire.side_effect = lambda *_: order.append('admit') or True
         attempts = []
-        def upstream(_session, request):
+        def upstream(_session, request, **_kwargs):
             order.append('responses')
             attempts.append(request)
             if len(attempts) == 1:

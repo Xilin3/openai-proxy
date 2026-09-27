@@ -52,7 +52,7 @@ class AdmissionHttpTest(unittest.TestCase):
                + '\r\nContent-Length: ' + str(len(body)) + '\r\n\r\n').encode() + body
         try:
             with patch('bps_proxy.server.load_session', return_value=None), patch(
-                    'bps_proxy.server.iter_events', side_effect=lambda *args: iter([completion([])])) as upstream:
+                    'bps_proxy.server.iter_events', side_effect=lambda *args, **_kwargs: iter([completion([])])) as upstream:
                 conn = socket.create_connection(server.server_address, timeout=3)
                 conn.sendall(raw)
                 wait_for(lambda: server.admission.snapshot() == (1, 1))
@@ -85,7 +85,7 @@ class AdmissionHttpTest(unittest.TestCase):
         release = threading.Event()
         entered = threading.Event()
         calls = []
-        def upstream(session, body):
+        def upstream(session, body, **_kwargs):
             calls.append(body)
             entered.set()
             release.wait(3)
@@ -138,7 +138,7 @@ class AdmissionHttpTest(unittest.TestCase):
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         release, lock = threading.Event(), threading.Lock()
         starts = []
-        def upstream(session, body):
+        def upstream(session, body, **_kwargs):
             with lock:
                 starts.append(time.monotonic())
             if not release.wait(5):

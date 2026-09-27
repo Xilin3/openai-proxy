@@ -6,6 +6,7 @@ import json
 import logging
 import queue
 import socket
+import sys
 import threading
 import time
 from typing import Iterator
@@ -21,8 +22,19 @@ UPSTREAM_IDLE_TIMEOUT = 300
 UPSTREAM_TOTAL_TIMEOUT = 900
 MAX_QUEUED_LINES = 8
 KEEPALIVE_SECONDS = 15.0
-MAX_EVENT_BYTES = 4 * 1024 * 1024
+MAX_EVENT_BYTES = 16 * 1024 * 1024
+LARGE_EVENT_BYTES = 4 * 1024 * 1024
 MAX_ERROR_BYTES = 4096
+LOG_EVENT_TYPES = frozenset({
+    'message', 'response.created', 'response.in_progress', 'response.completed',
+    'response.failed', 'response.incomplete', 'response.output_item.added',
+    'response.output_item.done', 'response.content_part.added',
+    'response.content_part.done', 'response.output_text.delta',
+    'response.output_text.done', 'response.function_call_arguments.delta',
+    'response.function_call_arguments.done', 'response.reasoning_summary_text.delta',
+    'response.reasoning_summary_text.done', 'response.compaction.delta',
+    'response.compaction.done', 'error',
+})
 
 
 class UpstreamError(RuntimeError):
@@ -30,6 +42,31 @@ class UpstreamError(RuntimeError):
         super().__init__(message)
         self.status = status
         self.message = message
+
+
+class _SSESizeError(UpstreamError):
+    def __init__(self, kind: str, observed_bytes: int, limit_bytes: int) -> None:
+        super().__init__(502, f'upstream SSE {kind} was too large')
+        self.kind = kind
+        self.observed_bytes = observed_bytes
+        self.limit_bytes = limit_bytes
+
+
+def validate_max_sse_event_bytes(value: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 < value < sys.maxsize:
+        raise ValueError('max_sse_event_bytes must be a positive integer below the platform read limit')
+    return value
+
+
+def _log_event_type(event: str) -> str:
+    # Upstream event names are untrusted and may contain private text.
+    return event if event in LOG_EVENT_TYPES else 'other'
+
+
+def _log_size_error(exc: _SSESizeError, event: str, request_id: str) -> None:
+    log.warning('upstream SSE size limit exceeded request_id=%s event_type=%s '
+                'limit_kind=%s observed_bytes=%s limit_bytes=%s',
+                request_id, _log_event_type(event), exc.kind, exc.observed_bytes, exc.limit_bytes)
 
 
 def _headers(session: ChatGPTSession) -> dict[str, str]:
@@ -166,7 +203,7 @@ def _clear_body_timeout(response) -> None:
         log.debug("could not clear upstream body timeout", exc_info=True)
 
 
-def _read_upstream(response, lines, stopped) -> None:
+def _read_upstream(response, lines, stopped, max_event_bytes: int) -> None:
     def send(value):
         while not stopped.is_set():
             try:
@@ -176,9 +213,9 @@ def _read_upstream(response, lines, stopped) -> None:
                 continue
     try:
         while not stopped.is_set():
-            line = response.readline(MAX_EVENT_BYTES + 1)
-            if len(line) > MAX_EVENT_BYTES:
-                raise UpstreamError(502, 'upstream SSE line was too large')
+            line = response.readline(max_event_bytes + 1)
+            if len(line) > max_event_bytes:
+                raise _SSESizeError('line', len(line), max_event_bytes)
             send(line)
             if not line:
                 return
@@ -186,7 +223,9 @@ def _read_upstream(response, lines, stopped) -> None:
         send(exc)
 
 
-def iter_events(session: ChatGPTSession, body: dict) -> Iterator[tuple[str, dict]]:
+def iter_events(session: ChatGPTSession, body: dict, *, max_event_bytes: int | None = None,
+                request_id: str = '-') -> Iterator[tuple[str, dict]]:
+    max_event_bytes = validate_max_sse_event_bytes(MAX_EVENT_BYTES if max_event_bytes is None else max_event_bytes)
     payload = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     req = request.Request(UPSTREAM_URL, data=payload, headers=_headers(session), method="POST")
     response = None
@@ -220,7 +259,7 @@ def iter_events(session: ChatGPTSession, body: dict) -> Iterator[tuple[str, dict
         _clear_body_timeout(response)
         reader = threading.Thread(
             target=_read_upstream,
-            args=(response, lines, stopped),
+            args=(response, lines, stopped, max_event_bytes),
             name="bps-upstream",
             daemon=True,
         )
@@ -229,6 +268,7 @@ def iter_events(session: ChatGPTSession, body: dict) -> Iterator[tuple[str, dict
         def flush() -> Iterator[tuple[str, dict]]:
             nonlocal pending_event, data_lines, data_bytes, response_id, last_activity, done
             parsed = _event_payload(pending_event, data_lines)
+            event_bytes = data_bytes
             pending_event = "message"
             data_lines = []
             data_bytes = 0
@@ -238,6 +278,10 @@ def iter_events(session: ChatGPTSession, body: dict) -> Iterator[tuple[str, dict
             if event == "__done__":
                 done = True
                 return
+            if event_bytes >= LARGE_EVENT_BYTES:
+                log.info('large upstream SSE event request_id=%s event_type=%s '
+                         'event_bytes=%s limit_bytes=%s',
+                         request_id, _log_event_type(event), event_bytes, max_event_bytes)
             last_activity = time.monotonic()
             if event == "response.created":
                 created = event_payload.get("response")
@@ -265,6 +309,9 @@ def iter_events(session: ChatGPTSession, body: dict) -> Iterator[tuple[str, dict
                     yield from keepalive()
                 continue
             if isinstance(raw_line, Exception):
+                if isinstance(raw_line, _SSESizeError):
+                    _log_size_error(raw_line, pending_event, request_id)
+                    raise raw_line
                 log.warning("upstream connection failed stage=read exception_type=%s", type(raw_line).__name__)
                 if isinstance(raw_line, (TimeoutError, socket.timeout)):
                     raise UpstreamError(504, "upstream stream timed out") from raw_line
@@ -293,9 +340,11 @@ def iter_events(session: ChatGPTSession, body: dict) -> Iterator[tuple[str, dict
                 continue
             if line.startswith("data:"):
                 piece = line[5:].lstrip()
-                data_bytes += len(piece.encode("utf-8"))
-                if data_bytes > MAX_EVENT_BYTES:
-                    raise UpstreamError(502, "upstream SSE event was too large")
+                data_bytes += len(piece.encode('utf-8')) + (1 if data_lines else 0)
+                if data_bytes > max_event_bytes:
+                    exc = _SSESizeError('event', data_bytes, max_event_bytes)
+                    _log_size_error(exc, pending_event, request_id)
+                    raise exc
                 data_lines.append(piece)
                 continue
             # SSE permits unknown fields; keep strictness for malformed event data by ignoring them.

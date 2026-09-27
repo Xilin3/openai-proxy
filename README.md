@@ -90,6 +90,18 @@ curl http://127.0.0.1:8787/health
 
 这些是代理的默认保护参数，参考 ghcp_proxy 的连接池与请求发起策略，不代表 OpenAI 公布的账号配额。
 
+### 流式响应大小
+
+上游 SSE 的单行和单事件默认上限均为 **16 MiB**，可用正整数参数调整，例如：
+
+```bash
+./start.sh --max-sse-event-mib 32
+```
+
+这是响应字节大小限制，与模型的上下文 token 上限分别生效。调高会增加并发请求可能占用的内存；修改启动参数后需重启代理。
+
+启动日志的 `max_sse_event_bytes` 显示实际生效值。超限日志记录 `request_id`、事件类型、行或事件限制、已读取字节数及上限，不记录响应正文。单行超限时只读取到上限加 1 字节，因此日志中的 `observed_bytes` 是已观测值，不是完整行大小。至少 4 MiB 的成功事件另记 `event_bytes`，便于判断是否接近上限。
+
 ## 接到 Codex
 
 在用户配置 `~/.codex/config.toml` 顶层加一行，放在所有 `[table]` 之前；设置了 `CODEX_HOME` 时修改对应目录的 `config.toml`：
@@ -117,7 +129,7 @@ curl --fail http://127.0.0.1:8787/v1/models
 
 然后在 Codex 新建对话并发出一条请求，按相同的 `request_id` 对照代理日志：
 
-- `service configuration` 显示已加载代码的 `build` 摘要、并发参数、目录版本与校验值。
+- `service configuration` 显示已加载代码的 `build` 摘要、并发参数、SSE 大小上限、目录版本与校验值。
 - `local request` 应出现 `POST /v1/responses`；`upstream start` 分别记录 `requested_model` 和实际 `model`，可用于核对型号映射。
 - `relay ended` 的 `terminal=response.completed` 表示该次响应已完成。HTTP 200 或健康接口成功本身不能证明模型请求完成；流式响应仍可能以 `response.failed` 结束。
 
@@ -208,7 +220,7 @@ python3 tools/candidate.py run -- exec --image /path/to/image.png '描述这张�
 
 同一轮工具续接保持 `turn_id`，内部重试会递增 `agent_iteration`；客户端重复提交同一阶段保持计数，收到下一阶段的工具结果后继续递增。计数会随缓存保存，避免内部重试后收到客户端工具结果时回退。旧格式缓存可读取，但无作用域的旧条目不会自动用于新账号或新会话。
 
-普通文本增量转发。可执行工具调用只在上游正式完成响应后交付；断流、事件损坏或连续工具转接失败会保留失败状态，不合成成功响应。网络超时返回 `504`，其他连接错误返回 `502`；如果流式响应已经开始，则通过 SSE `response.failed` 事件报告。单条上游事件最多 4 MiB，空闲连接超时为 5 分钟，单次上游流最长为 15 分钟。
+普通文本增量转发。可执行工具调用只在上游正式完成响应后交付；断流、事件损坏或连续工具转接失败会保留失败状态，不合成成功响应。网络超时返回 `504`，其他连接错误返回 `502`；如果流式响应已经开始，则通过 SSE `response.failed` 事件报告。上游 SSE 单行及单事件默认最多 16 MiB，可通过 `--max-sse-event-mib` 调整；超限会关闭上游连接并报告失败。空闲连接超时为 5 分钟，单次上游流最长为 15 分钟。
 
 Excel 行为指令由后端注入，代理无法将其从模型实际收到的提示中删除。返回给客户端的 `instructions` 字段会还原为客户端原文，但这不代表后端提示词已被清除；该转接方式无法保证与官方 Responses API 完全一致。
 
@@ -231,6 +243,8 @@ python3 tools/probe_compatibility.py
 协议细节与测试覆盖见 [Codex 兼容说明](docs/codex-compatibility.md)。
 
 ## 实现参考
+
+SSE 单行与聚合事件的 16 MiB 保护参考 ranxi2001/sub2api 的 BPS 读取器（核对版本 `fe27f98`，`backend/internal/service/basispoints/stream.go`）；本代理增加了独立的启动参数和脱敏大小诊断。
 
 图片附件上传与重传流程参考 Kaixxrua/excel-codex-bridge（核对版本 `66c41df`），请求解压边界参考其 `8a277df` 版本。请求限额、图片隔离与终态校验参考 ranxi2001/sub2api 的 BPS 通道（核对版本 `d215edd`），原生压缩触发方式参考其 `00bdb50` 版本。采用独立实现，保留轻量 HTTP 服务，仅增加 zstandard 依赖；没有引入这些项目的服务端框架或公网图片中转。
 

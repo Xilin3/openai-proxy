@@ -1,4 +1,5 @@
 import http.client
+import io
 import json
 import re
 import threading
@@ -34,6 +35,59 @@ class DiagnosticTests(unittest.TestCase):
             return response.status, response.read()
         finally:
             connection.close()
+
+    def test_five_mib_terminal_event_reaches_http_client(self):
+        event, payload = completed([])
+        opaque = {'id': 'rs_large', 'type': 'reasoning', 'summary': [],
+                  'encrypted_content': 'private-reasoning-' + 'x' * (5 * 1024 * 1024)}
+        payload['response']['output'] = [opaque]
+        encoded = json.dumps(payload).encode()
+        response = io.BytesIO(b'data: ' + encoded + bytes([10, 10]))
+        response.headers = {'Content-Type': 'text/event-stream'}
+        with self.assertLogs('bps_proxy', 'INFO') as logs, patch(
+                'bps_proxy.server.load_session', return_value=ChatGPTSession('fake', 'account', '', 0)), patch(
+                'bps_proxy.upstream.request.urlopen', return_value=response) as open_upstream:
+            status, body = self.send(source={'stream': False})
+        self.assertTrue(response.closed)
+        open_upstream.assert_called_once()
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)['output'], [opaque])
+        text = chr(10).join(logs.output)
+        self.assertIn('event_type=' + event + ' event_bytes=' + str(len(encoded)), text)
+        self.assertIn('terminal=response.completed', text)
+        self.assertNotIn('private-reasoning', text)
+
+    def test_sse_limit_reaches_parser_and_preserves_failed_terminal(self):
+        created = {'type': 'response.created', 'response': {'id': 'resp_size', 'status': 'in_progress', 'output': []}}
+        event, payload = completed([])
+        payload['response']['private_field'] = 'private-payload-' + 'x' * 512
+        newline = bytes([10])
+        oversized = b'event: ' + event.encode() + newline + b'data: ' + json.dumps(payload).encode() + newline * 2
+        for stream_started in (False, True):
+            prefix = b'data: ' + json.dumps(created).encode() + newline * 2 if stream_started else b''
+            response = io.BytesIO(prefix + oversized)
+            response.headers = {'Content-Type': 'text/event-stream'}
+            with self.subTest(stream_started=stream_started), self.assertLogs('bps_proxy', 'INFO') as logs, patch(
+                    'bps_proxy.server.load_session', return_value=ChatGPTSession('fake', 'account', '', 0)), patch(
+                    'bps_proxy.upstream.request.urlopen', return_value=response) as open_upstream, patch.object(
+                    self.server, 'max_sse_event_bytes', 256):
+                status, body = self.send()
+            self.assertTrue(response.closed)
+            open_upstream.assert_called_once()
+            self.assertEqual(status, 200 if stream_started else 502)
+            self.assertNotIn(b'response.completed', body)
+            if stream_started:
+                self.assertIn(b'response.failed', body)
+            else:
+                self.assertIn('line was too large', json.loads(body)['error']['message'])
+            text = chr(10).join(logs.output)
+            self.assertIn('event_type=response.completed limit_kind=line observed_bytes=257 limit_bytes=256', text)
+            self.assertIn('terminal=response.failed', text)
+            for secret in ('private-payload', 'private-query', 'private-prompt', 'connection failed'):
+                self.assertNotIn(secret, text)
+            ids = re.findall('request_id=([a-f0-9]{12})', text)
+            self.assertTrue(ids)
+            self.assertEqual(len(set(ids)), 1)
 
     def test_local_403_is_distinct_and_headers_are_not_logged(self):
         with self.assertLogs("bps_proxy", "INFO") as logs, patch("bps_proxy.server.load_session") as auth:

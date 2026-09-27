@@ -359,7 +359,7 @@ class RelayForwardTest(unittest.TestCase):
         self.assertNotIn("response.completed", [event for event, _ in events])
 
     def test_upstream_error_does_not_retry_a_partial_office_call(self):
-        def broken(*_args):
+        def broken(*_args, **_kwargs):
             yield "response.output_item.done", {"output_index": 0, "item": transport("call_bad", HTML)}
             raise UpstreamError(502, "connection reset")
 

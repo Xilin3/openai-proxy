@@ -59,12 +59,17 @@ CLI 参数 --max-concurrent、--max-pending、--queue-timeout 可覆盖；队满
 会话标识使用短哈希；未知路由仅记 other，WebSocket 升级单独记布尔值，不输出原始路径、查询、提示、工具脚本或凭据。
 Origin 守卫与 TLS 失败语义保留；inner_json 仍使用原有有界纠正，不执行代理端脚本。
 
+SSE 单行及聚合事件默认均限 16 MiB，CLI `--max-sse-event-mib` 接受正整数；服务实例各自持有配置，不修改进程全局值。单行按原始字节（含字段前缀和行结束符）计数，聚合事件按拼接后的 UTF-8 data 内容（含行间换行）计数，空 data 行也占换行字节。读取队列仍最多保存 8 行，调高大小上限会增加潜在内存占用。
+
+大小超限日志单独记录 `request_id`、`event_type`、`limit_kind`、`observed_bytes` 与 `limit_bytes`，不归类成网络连接错误。行超限只读取上限加 1 字节，已观测值是完整大小的下界；成功解析的至少 4 MiB 事件记录实际 `event_bytes`。事件类型仅输出允许列表中的名称，其余记为 other；无 event 字段且尚未解析 data 时记为 SSE 默认类型 message。日志不包含响应正文或加密推理内容。超限仍沿用 502 / 流已开始后的 response.failed，不补造 response.completed。
+
 ## 验证
 
 - tests/test_lite.py、tests/test_catalog.py：四模型冷缓存、声明隔离、模板与版本快照。
 - tests/test_admission.py、tests/test_admission_http.py：FIFO、队满、超时、认证失败、异常、RST 与半关闭。
 - tests/test_rate_limit.py：滚动窗口、等待取消与关闭、重试和上传计数；HTTP 测试覆盖 8 路活动请求与第 9 路排队。
 - tests/test_request_body.py：编码、大小、损坏和多帧边界。
+- tests/test_sse_limits.py、tests/test_diagnostics.py、tests/test_cli.py：5 MiB 事件转发、16 MiB 默认上限、逐行与聚合字节边界、日志脱敏、配置隔离和 HTTP / SSE 失败终态。
 - tests/test_compatibility.py：真实回环 HTTP、compact 状态、工具目录与不透明历史往返。
 - tools/probe_compatibility.py：已安装 Codex、临时用户配置和模拟上游的完整连接验收。
 - 原有工具、图片、隔离和终态测试继续运行。
@@ -77,4 +82,5 @@ Origin 守卫与 TLS 失败语义保留；inner_json 仍使用原有有界纠正
 - https://developers.openai.com/api/reference/resources/responses/streaming-events
 - openai/codex rust-v0.154.0：protocol/src/openai_models.rs、codex-api/src/endpoint/compact.rs、core/src/client.rs。
 - ranxi2001/sub2api 00bdb50：原生 compaction_trigger 适配思路。
+- ranxi2001/sub2api fe27f9895a75e12562f33eff70f21c660329a684：basispoints/stream.go 的 16 MiB 单行与聚合事件限制。
 - Kaixxrua/excel-codex-bridge 8a277df：有大小保护的请求解压思路。

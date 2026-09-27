@@ -22,7 +22,7 @@ from bps_proxy.catalog import CatalogError, catalog_snapshot
 from bps_proxy.compaction import compact_request, compact_response, is_compaction
 from bps_proxy.images import Pictures
 from bps_proxy.request_body import RequestBodyError, content_encoding, decode_body
-from bps_proxy.upstream import UpstreamError, iter_events
+from bps_proxy.upstream import MAX_EVENT_BYTES, UpstreamError, iter_events, validate_max_sse_event_bytes
 from bps_proxy.tool_policy import ToolSelectionError, missing_call_message, missing_call_reason, requires_tool_call
 from bps_proxy.wire import (CallMemory, DEFAULT_MODEL, MODEL_ALIASES, MODEL_DISPLAY_NAMES, ProtocolError, StreamRewriter,
                             append_input, conversation_identity, continue_message, declared_client_tools,
@@ -59,11 +59,13 @@ class ProxyServer(ThreadingHTTPServer):
     def __init__(self, address: tuple[str, int], memory: CallMemory, *,
                  max_concurrent: int = MAX_CONCURRENT_REQUESTS,
                  max_pending: int = MAX_PENDING_REQUESTS, queue_timeout: float = QUEUE_TIMEOUT,
-                 upstream_rps: int = UPSTREAM_REQUESTS_PER_SECOND) -> None:
+                 upstream_rps: int = UPSTREAM_REQUESTS_PER_SECOND,
+                 max_sse_event_bytes: int = MAX_EVENT_BYTES) -> None:
         if not is_loopback(address[0]):
             raise ValueError('proxy must bind to a loopback address')
         if ':' in address[0]:
             self.address_family = socket.AF_INET6
+        self.max_sse_event_bytes = validate_max_sse_event_bytes(max_sse_event_bytes)
         self.memory = memory
         self.pictures = Pictures()
         self.admission = Admission(max_concurrent, max_pending, queue_timeout)
@@ -395,7 +397,9 @@ class Handler(BaseHTTPRequestHandler):
                 received = False
                 upstream = None
                 try:
-                    upstream = iter_events(session, body)
+                    upstream = iter_events(session, body,
+                                           max_event_bytes=getattr(self.server, 'max_sse_event_bytes', MAX_EVENT_BYTES),
+                                           request_id=self._request_id())
                     for event, payload in upstream:
                         received = True
                         if event == 'error':
@@ -568,9 +572,10 @@ def serve(host: str, port: int, memory: CallMemory, **limits) -> None:
         source_hash.update(file.read_bytes())
     server = ProxyServer((host, port), memory, **limits)
     log.info('listening on loopback port=%s default_model=%s', port, DEFAULT_MODEL)
-    log.info('service configuration build=%s concurrency=%s max_pending=%s queue_timeout=%s upstream_rps=%s catalog_source=%s catalog_version=%s catalog_sha256=%s',
+    log.info('service configuration build=%s concurrency=%s max_pending=%s queue_timeout=%s upstream_rps=%s max_sse_event_bytes=%s catalog_source=%s catalog_version=%s catalog_sha256=%s',
              source_hash.hexdigest()[:16], server.admission.limit, server.admission.max_pending,
-             server.admission.timeout, server.upstream_rate.limit, catalog_info['catalog_source'], catalog_info['catalog_client_version'],
+             server.admission.timeout, server.upstream_rate.limit, server.max_sse_event_bytes,
+             catalog_info['catalog_source'], catalog_info['catalog_client_version'],
              catalog_info['catalog_sha256'])
     try:
         server.serve_forever()

@@ -39,7 +39,7 @@ class CompatibilityHttpTest(unittest.TestCase):
     def setUp(self):
         self.server.memory = CallMemory()
         self.sent = []
-        def upstream(session, body):
+        def upstream(session, body, **_kwargs):
             self.sent.append(copy.deepcopy(body))
             return iter([completion([copy.deepcopy(OPAQUE)])])
         self.auth = patch('bps_proxy.server.load_session', return_value=None)

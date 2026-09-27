@@ -68,7 +68,7 @@ def main():
         override = root / 'instructions.txt'
         override.write_text('PROBE_EXPLICIT_INSTRUCTIONS: execute the requested local operation.')
 
-        def upstream(session, body):
+        def upstream(session, body, **_kwargs):
             bodies.append(copy.deepcopy(body))
             model = body['model']
             state = states.setdefault(model, {})

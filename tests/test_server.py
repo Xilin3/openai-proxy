@@ -67,7 +67,7 @@ class RelayTest(unittest.TestCase):
     def test_closing_relay_releases_upstream(self):
         closed = []
 
-        def upstream(*_):
+        def upstream(*_, **_kwargs):
             try:
                 yield "response.created", {"type": "response.created", "response": {"id": "resp_1"}}
                 yield terminal()
@@ -107,7 +107,7 @@ class RelayTest(unittest.TestCase):
 class HttpTest(unittest.TestCase):
     def setUp(self):
         auth = patch("bps_proxy.server.load_session", return_value=None)
-        upstream = patch("bps_proxy.server.iter_events", side_effect=lambda *_: iter([terminal()]))
+        upstream = patch("bps_proxy.server.iter_events", side_effect=lambda *_, **_kwargs: iter([terminal()]))
         auth.start()
         upstream.start()
         self.addCleanup(auth.stop)

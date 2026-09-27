@@ -12,6 +12,7 @@ from bps_proxy.server import serve, MAX_CONCURRENT_REQUESTS, MAX_PENDING_REQUEST
 from bps_proxy.admission import Admission
 from bps_proxy.rate_limit import RequestRateLimiter, UPSTREAM_REQUESTS_PER_SECOND
 from bps_proxy.catalog import catalog_snapshot
+from bps_proxy.upstream import MAX_EVENT_BYTES, validate_max_sse_event_bytes
 from bps_proxy.wire import CallMemory, DEFAULT_MODEL
 
 
@@ -26,6 +27,8 @@ def main() -> None:
     parser.add_argument('--max-pending', type=int, default=MAX_PENDING_REQUESTS)
     parser.add_argument('--upstream-rps', type=int, default=UPSTREAM_REQUESTS_PER_SECOND, help='每秒最多发起的上游请求数')
     parser.add_argument('--queue-timeout', type=float, default=QUEUE_TIMEOUT, help='排队最长等待秒数')
+    parser.add_argument('--max-sse-event-mib', type=int, default=MAX_EVENT_BYTES // (1024 * 1024),
+                        help='上游 SSE 单行及单事件大小上限，单位 MiB（默认 16）')
     parser.add_argument(
         "--state",
         type=Path,
@@ -44,6 +47,9 @@ def main() -> None:
     try:
         Admission(args.max_concurrent, args.max_pending, args.queue_timeout)
         RequestRateLimiter(args.upstream_rps)
+        if args.max_sse_event_mib <= 0:
+            raise ValueError('--max-sse-event-mib must be positive')
+        max_sse_event_bytes = validate_max_sse_event_bytes(args.max_sse_event_mib * 1024 * 1024)
         if args.model_catalog is not None:
             os.environ['BPS_MODEL_CATALOG'] = str(args.model_catalog.expanduser().resolve())
         catalog_snapshot()
@@ -65,7 +71,8 @@ def main() -> None:
         flush=True,
     )
     serve(args.host, args.port, CallMemory(args.state), max_concurrent=args.max_concurrent,
-          max_pending=args.max_pending, queue_timeout=args.queue_timeout, upstream_rps=args.upstream_rps)
+          max_pending=args.max_pending, queue_timeout=args.queue_timeout, upstream_rps=args.upstream_rps,
+          max_sse_event_bytes=max_sse_event_bytes)
 
 
 if __name__ == "__main__":
