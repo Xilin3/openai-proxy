@@ -35,11 +35,16 @@ def _native(call_id: str = "call_QsjZ") -> dict:
 
 
 class WireTest(unittest.TestCase):
-    def test_luna_compatibility_alias_does_not_redirect_other_models(self):
-        cases = {"gpt-6-luna": "gpt-5.6-luna", " gpt-6-luna ": "gpt-5.6-luna",
-                 "gpt-5.6-luna": "gpt-5.6-luna", "gpt-6-astra": "gpt-6-astra",
-                 "gpt-6-sol": "gpt-6-sol", "gpt-6-luna-preview": "gpt-6-luna-preview",
-                 "gpt-5.6-luna-excel": "gpt-5.6-luna"}
+    def test_six_series_aliases_route_only_to_corresponding_five_six_models(self):
+        cases = {"gpt-6-astra": "gpt-6-astra", "gpt-6-astra-excel": "gpt-6-astra"}
+        for family in ('sol', 'terra', 'luna'):
+            cases.update({
+                'gpt-6-' + family: 'gpt-5.6-' + family,
+                ' gpt-6-' + family + ' ': 'gpt-5.6-' + family,
+                'gpt-5.6-' + family: 'gpt-5.6-' + family,
+                'gpt-5.6-' + family + '-excel': 'gpt-5.6-' + family,
+                'gpt-6-' + family + '-preview': 'gpt-6-' + family + '-preview',
+            })
         for requested, expected in cases.items():
             with self.subTest(model=requested):
                 source = {"model": requested, "input": "Generate a title", "reasoning": {"effort": "high"}}
@@ -48,6 +53,25 @@ class WireTest(unittest.TestCase):
                 self.assertEqual(body["model_selection"], "explicit")
                 self.assertEqual(body["reasoning_effort"], "high")
                 self.assertEqual(source["model"], requested)
+
+    def test_family_aliases_apply_to_standard_lite_and_compaction(self):
+        for family in ('sol', 'terra', 'luna'):
+            tool = {'type': 'custom', 'name': 'exec'}
+            requests = [
+                {'input': 'Generate a title', 'tools': [tool]},
+                {'input': [{'type': 'additional_tools', 'role': 'developer', 'tools': [tool]},
+                           {'role': 'user', 'content': 'Run the subtask'}]},
+                {'input': [{'role': 'user', 'content': 'Continue'}, {'type': 'compaction_trigger'}],
+                 'tool_choice': 'none'},
+            ]
+            for index, request in enumerate(requests):
+                with self.subTest(family=family, variant=index):
+                    request['model'] = 'gpt-6-' + family
+                    before = json.dumps(request, sort_keys=True)
+                    body = prepare_body(request, CallMemory())
+                    self.assertEqual(body['model'], 'gpt-5.6-' + family)
+                    self.assertEqual(body['model_selection'], 'explicit')
+                    self.assertEqual(json.dumps(request, sort_keys=True), before)
 
     def test_effort_has_no_max_tier(self) -> None:
         self.assertEqual(normalize_effort("max"), "xhigh")

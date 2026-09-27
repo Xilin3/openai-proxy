@@ -7,6 +7,7 @@ name = "bps-proxy"
 version = "0.1.0"
 description = "Local Responses proxy for the ChatGPT Excel backend"
 requires-python = ">=3.9"
+dependencies = ["zstandard>=0.23.0"]
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
@@ -27,3 +28,6 @@ bps-proxy = "bps_proxy.__main__:main"
 
 [tool.setuptools.packages.find]
 include = ["bps_proxy*"]
+
+[tool.setuptools.package-data]
+bps_proxy = ["data/*.json"]

@@ -76,7 +76,9 @@ class CandidateTests(unittest.TestCase):
         args = self.candidate.cli_args(18787, ['exec', 'hello'])
         self.assertEqual(args[0], 'codex')
         self.assertEqual(args[-2:], ['exec', 'hello'])
-        self.assertIn('model_providers.bps.base_url="http://127.0.0.1:18787/v1"', args)
+        self.assertIn('openai_base_url="http://127.0.0.1:18787/v1"', args)
+        self.assertIn('model_provider="openai"', args)
+        self.assertFalse(any('model_providers.' in arg for arg in args))
         self.assertFalse(any('config.toml' in arg for arg in args))
 
     def test_stop_does_not_signal_an_unowned_pid(self):

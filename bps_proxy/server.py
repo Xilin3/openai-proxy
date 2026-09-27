@@ -3,23 +3,30 @@
 from __future__ import annotations
 
 import ipaddress
+import hashlib
 import json
 import logging
 import socket
-import threading
 import time
 import uuid
 from contextlib import closing
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
 from bps_proxy.auth import AuthError, load_session
+from bps_proxy.admission import Admission
+from bps_proxy.rate_limit import RequestRateLimiter, UPSTREAM_REQUESTS_PER_SECOND
+from bps_proxy.catalog import CatalogError, catalog_snapshot
+from bps_proxy.compaction import compact_request, compact_response, is_compaction
 from bps_proxy.images import Pictures
+from bps_proxy.request_body import RequestBodyError, content_encoding, decode_body
 from bps_proxy.upstream import UpstreamError, iter_events
 from bps_proxy.tool_policy import ToolSelectionError, missing_call_message, missing_call_reason, requires_tool_call
-from bps_proxy.wire import (CallMemory, DEFAULT_MODEL, MODEL_ALIASES, ProtocolError, StreamRewriter,
-                            conversation_identity, continue_message, model_catalog, office_stub, prepare_body)
+from bps_proxy.wire import (CallMemory, DEFAULT_MODEL, MODEL_ALIASES, MODEL_DISPLAY_NAMES, ProtocolError, StreamRewriter,
+                            append_input, conversation_identity, continue_message, declared_client_tools,
+                            model_catalog, office_stub, prepare_body)
 
 log = logging.getLogger('bps_proxy')
 MAX_OFFICE_HOPS = 3
@@ -27,7 +34,11 @@ MAX_NO_CALL_RETRIES = 1
 MAX_IMAGE_RETRIES = 4
 MAX_REQUEST_BYTES = 32 * 1024 * 1024
 REQUEST_TIMEOUT = 30
-MAX_CONCURRENT_REQUESTS = 2
+MAX_CONCURRENT_REQUESTS = 8
+MAX_PENDING_REQUESTS = 32
+QUEUE_TIMEOUT = 120
+MAX_COMPACT_EVENTS = 4096
+MAX_COMPACT_EVENT_BYTES = 32 * 1024 * 1024
 TERMINALS = {'response.completed', 'response.failed', 'response.incomplete'}
 
 
@@ -45,15 +56,24 @@ class ProxyServer(ThreadingHTTPServer):
     daemon_threads = True
     request_queue_size = 32
 
-    def __init__(self, address: tuple[str, int], memory: CallMemory) -> None:
+    def __init__(self, address: tuple[str, int], memory: CallMemory, *,
+                 max_concurrent: int = MAX_CONCURRENT_REQUESTS,
+                 max_pending: int = MAX_PENDING_REQUESTS, queue_timeout: float = QUEUE_TIMEOUT,
+                 upstream_rps: int = UPSTREAM_REQUESTS_PER_SECOND) -> None:
         if not is_loopback(address[0]):
             raise ValueError('proxy must bind to a loopback address')
         if ':' in address[0]:
             self.address_family = socket.AF_INET6
         self.memory = memory
         self.pictures = Pictures()
-        self.admission = threading.BoundedSemaphore(MAX_CONCURRENT_REQUESTS)
+        self.admission = Admission(max_concurrent, max_pending, queue_timeout)
+        self.upstream_rate = RequestRateLimiter(upstream_rps)
         super().__init__(address, Handler)
+
+    def server_close(self):
+        self.admission.close()
+        self.upstream_rate.close()
+        super().server_close()
 
     def get_request(self):
         connection, address = super().get_request()
@@ -68,21 +88,25 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args: Any) -> None:
         # Request paths and headers can contain client-provided secrets.
         route = getattr(self, "path", "").partition("?")[0].rstrip("/") or "/"
-        if route not in ("/health", "/v1/health", "/models", "/v1/models", "/responses", "/v1/responses"):
+        if route not in ("/health", "/v1/health", "/models", "/v1/models", "/responses", "/v1/responses",
+                         "/responses/compact", "/v1/responses/compact"):
             route = "other"
         method = getattr(self, "command", None)
         if method not in ("GET", "POST", "OPTIONS", "HEAD"):
             method = "other"
         log.info("local request request_id=%s method=%s route=%s status=%s",
                  self._request_id(), method, route, args[1] if len(args) > 1 else "-")
+        if method == 'GET':
+            log.info('get transport request_id=%s websocket_upgrade=%s', self._request_id(),
+                     self.headers.get('Upgrade', '').lower() == 'websocket')
 
     def _request_id(self):
         if not hasattr(self, "_trace_id"):
             self._trace_id = uuid.uuid4().hex[:12]
         return self._trace_id
 
-    def _error(self, status: int, message: str, kind: str = 'invalid_request_error') -> None:
-        self._json(status, {'error': {'message': message, 'type': kind}})
+    def _error(self, status: int, message: str, kind: str = 'invalid_request_error', headers=None) -> None:
+        self._json(status, {'error': {'message': message, 'type': kind}}, headers=headers)
 
     def _guard(self) -> bool:
         hosts = self.headers.get_all('Host') or []
@@ -112,8 +136,10 @@ class Handler(BaseHTTPRequestHandler):
         if len(lengths[0]) > 12 or int(lengths[0]) > MAX_REQUEST_BYTES:
             self._error(413, '请求体超过 32 MiB')
             return None
-        if self.headers.get('Content-Encoding', 'identity').lower() != 'identity':
-            self._error(415, '请发送未压缩的 JSON 请求体')
+        try:
+            content_encoding(self.headers)
+        except RequestBodyError as exc:
+            self._error(exc.status, str(exc))
             return None
         return int(lengths[0])
 
@@ -129,22 +155,38 @@ class Handler(BaseHTTPRequestHandler):
         if path in ('/health', '/v1/health'):
             self._json(200, {'ok': True})
         elif path in ('/v1/models', '/models'):
-            models = model_catalog()
+            try:
+                models = model_catalog()
+            except CatalogError as exc:
+                self._error(503, str(exc), 'server_error')
+                return
             self._json(200, {'object': 'list', 'data': models, 'models': models})
+        elif path in ('/v1/responses', '/responses') and self.headers.get('Upgrade', '').lower() == 'websocket':
+            # Codex falls back to HTTP/SSE on an explicit unsupported upgrade.
+            self._error(426, '此连接使用 HTTP POST /responses 和 SSE')
         else:
             self._error(404, 'not found')
 
     def do_POST(self) -> None:
         if not self._guard():
             return
-        if urlparse(self.path).path.rstrip('/') not in ('/v1/responses', '/responses'):
+        if urlparse(self.path).path.rstrip('/') not in ('/v1/responses', '/responses',
+                                                       '/v1/responses/compact', '/responses/compact'):
             self._error(404, 'not found')
             return
         length = self._body_length()
         if length is None:
             return
-        if not self.server.admission.acquire(blocking=False):
-            self._error(503, '代理正在处理其他请求，请稍后重试', 'server_error')
+        admission = self.server.admission.acquire(self._connection_aborted)
+        log.info('admission request_id=%s reason=%s queue_wait_ms=%s active=%s queued=%s',
+                 self._request_id(), admission.reason, admission.wait_ms, admission.active, admission.queued)
+        if admission.reason != 'accepted':
+            self.close_connection = True
+            if admission.reason != 'cancelled':
+                try:
+                    self._error(503, '代理繁忙，请稍后重试', 'server_error', headers={'Retry-After': '1'})
+                except (BrokenPipeError, ConnectionResetError, socket.timeout):
+                    pass
             return
         try:
             self._post(length)
@@ -152,6 +194,23 @@ class Handler(BaseHTTPRequestHandler):
             log.info('client disconnected')
         finally:
             self.server.admission.release()
+
+    def _connection_aborted(self):
+        # A FIN can be a valid half-close, so only a known socket error cancels admission.
+        try:
+            return bool(self.connection.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR))
+        except OSError:
+            return True
+
+    def _wait_for_upstream(self):
+        limiter = getattr(self.server, 'upstream_rate', None)
+        if limiter is None:
+            return
+        started = time.monotonic()
+        if not limiter.acquire(self._connection_aborted):
+            raise ConnectionResetError('upstream request cancelled before dispatch')
+        log.info('upstream pacing request_id=%s wait_ms=%s',
+                 self._request_id(), int((time.monotonic() - started) * 1000))
 
     def _post(self, length: int) -> None:
         try:
@@ -162,9 +221,17 @@ class Handler(BaseHTTPRequestHandler):
         if len(raw) != length:
             self._error(400, '请求体不完整')
             return
+        log.info('request body request_id=%s content_encoding=%s',
+                 self._request_id(), content_encoding(self.headers))
+        try:
+            raw = decode_body(raw, content_encoding(self.headers), MAX_REQUEST_BYTES)
+        except RequestBodyError as exc:
+            self._error(exc.status, str(exc))
+            return
         try:
             source = json.loads(raw.decode('utf-8'), parse_constant=lambda value: (_ for _ in ()).throw(ValueError('non-finite number')))
             self._validate(source)
+            compact = urlparse(self.path).path.rstrip('/').endswith('/responses/compact')
         except (UnicodeError, ValueError, RecursionError) as exc:
             message = str(exc) if type(exc) is ValueError else '请求体不是有效 JSON'
             self._error(400, message)
@@ -179,7 +246,7 @@ class Handler(BaseHTTPRequestHandler):
         started_at = time.monotonic()
         terminal = "none"
         try:
-            with closing(self._iter_relay(source, session)) as relay:
+            with closing(self._iter_relay(source, session, compact=compact)) as relay:
                 # Resolve HTTP rejections and upload failures before committing SSE headers.
                 first = next(relay)
                 if first[0] in TERMINALS:
@@ -202,7 +269,7 @@ class Handler(BaseHTTPRequestHandler):
                             final = payload.get('response')
                     if not isinstance(final, dict):
                         raise UpstreamError(502, '上游没有返回完整响应')
-                    self._json(200, final)
+                    self._json(200, compact_response(final) if compact else final)
         except (BrokenPipeError, ConnectionResetError, socket.timeout):
             terminal = "client_disconnected"
             raise
@@ -239,20 +306,34 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError('input 必须是字符串或消息数组')
         if isinstance(source['input'], list) and any(not isinstance(item, dict) for item in source['input']):
             raise ValueError('input 数组中的每一项必须是对象')
+        declared_client_tools(source)
+        if isinstance(source['input'], list) and any(item.get('type') == 'compaction_trigger' for item in source['input'][:-1]):
+            raise ValueError('compaction_trigger 必须位于 input 末尾')
         if 'stream' in source and not isinstance(source['stream'], bool):
             raise ValueError('stream 必须是布尔值')
         if source.get('previous_response_id') or source.get('conversation') or source.get('background'):
             raise ValueError('请发送完整对话历史，不支持后台请求或服务端续接')
 
-    def _iter_relay(self, source: dict, session: Any):
+    def _iter_relay(self, source: dict, session: Any, *, compact: bool = False):
+        request_kind = 'compact_endpoint' if compact else 'inline_compaction' if is_compaction(source) else 'responses'
+        declared, origin = declared_client_tools(source)
+        tools_present = 'tools' in source
+        compact = compact or is_compaction(source)
+        if compact:
+            source = compact_request(source)
         account = getattr(session, 'account_id', '')
         memory = self.server.memory
         if account:
             memory = memory.scoped(account + ':' + conversation_identity(source))
         pictures = getattr(self.server, 'pictures', None) or Pictures()
         tools = memory.bind_tools(source)
+        if origin == 'none':
+            origin = 'cache_or_code_mode' if tools else 'none'
+        conversation = hashlib.sha256((account + ':' + conversation_identity(source)).encode()).hexdigest()[:12]
         log.info("relay start request_id=%s tools_present=%s effective_tools=%s",
-                 self._request_id(), "tools" in source, len(tools))
+                 self._request_id(), tools_present, len(tools))
+        log.info('request context request_id=%s conversation=%s request_kind=%s tool_catalog_source=%s declared_tools=%s',
+                 self._request_id(), conversation, request_kind, origin, len(declared))
         if requires_tool_call(source) and not tools:
             raise ToolSelectionError('请求要求调用工具，但没有可用的已声明工具')
         working = json.loads(json.dumps(source))
@@ -290,19 +371,22 @@ class Handler(BaseHTTPRequestHandler):
 
         for hop in range(MAX_OFFICE_HOPS + MAX_NO_CALL_RETRIES + 1):
             terminal = None
+            compact_events = []
+            compact_event_bytes = 0
             for attempt in range(MAX_IMAGE_RETRIES + 1):
-                sent = pictures.rewrite(working, session, fresh=fresh)
+                sent = pictures.rewrite(working, session, fresh=fresh, before_upload=self._wait_for_upstream)
                 fresh.update(sent.uploaded)
                 body = prepare_body(sent.body, memory, identity_source=source, bump=bump)
                 bump = True
                 metadata = body['metadata']
-                known_models = {item["id"] for item in model_catalog()}
+                known_models = set(MODEL_DISPLAY_NAMES)
                 requested_model = source.get("model")
                 requested_model = requested_model.strip() if isinstance(requested_model, str) else DEFAULT_MODEL
                 requested_model = requested_model or DEFAULT_MODEL
                 if requested_model not in known_models | MODEL_ALIASES.keys():
                     requested_model = "unlisted"
                 model = body["model"] if body["model"] in known_models else "unlisted"
+                self._wait_for_upstream()
                 log.info("upstream start request_id=%s requested_model=%s model=%s turn_id=%s iteration=%s hop=%s image_attempt=%s",
                          self._request_id(), requested_model, model, metadata["turn_id"], metadata["agent_iteration"], hop, attempt)
                 rewriter = StreamRewriter(tools, memory, turn_id=metadata['turn_id'],
@@ -325,6 +409,12 @@ class Handler(BaseHTTPRequestHandler):
                                 if not seen_created:
                                     seen_created = True
                                     yield emit(name, rewritten)
+                            elif compact:
+                                # Release native compact items only after terminal validation.
+                                compact_event_bytes += len(json.dumps(rewritten, ensure_ascii=False).encode('utf-8'))
+                                if len(compact_events) >= MAX_COMPACT_EVENTS or compact_event_bytes > MAX_COMPACT_EVENT_BYTES:
+                                    raise UpstreamError(502, '上游压缩事件超过大小限制')
+                                compact_events.append((name, rewritten))
                             else:
                                 yield emit(name, rewritten)
                         if terminal:
@@ -363,6 +453,24 @@ class Handler(BaseHTTPRequestHandler):
             output = response.get('output', [])
             log.info("relay output request_id=%s terminal=%s client_calls=%s rejected_calls=%s no_call_retries=%s",
                      self._request_id(), name, len(rewriter.client_calls), len(rewriter.office_calls), no_call_retries)
+            if compact:
+                # A compact request is never retried as an ordinary model turn.
+                # In particular, never execute Office calls or simulate a summary.
+                if name == 'response.completed':
+                    if rewriter.office_calls or rewriter.client_calls:
+                        raise UpstreamError(502, '上游压缩请求意外返回了工具调用')
+                    compact_response(response)
+                    expected = next(item for item in output if item.get('type') == 'compaction')
+                    done = [event['item'] for event_name, event in compact_events
+                            if event_name == 'response.output_item.done'
+                            and event.get('item', {}).get('type') == 'compaction']
+                    if (len(done) != 1 or done[0].get('encrypted_content') != expected['encrypted_content']
+                            or (done[0].get('id') and expected.get('id') and done[0]['id'] != expected['id'])):
+                        raise UpstreamError(502, '上游压缩事件与完成结果不一致')
+                    for event_name, event in compact_events:
+                        yield emit(event_name, event)
+                yield emit(name, {**payload, 'response': response})
+                return
             if name == 'response.completed' and rewriter.office_calls and not rewriter.client_calls:
                 if office_retries >= MAX_OFFICE_HOPS:
                     yield failed('工具调用格式连续无效，客户端未执行这些调用，请重试')
@@ -392,7 +500,7 @@ class Handler(BaseHTTPRequestHandler):
         items = continued.get('input')
         if isinstance(items, str):
             items = [{'role': 'user', 'content': items}]
-        continued['input'] = list(items or []) + output + [{'role': 'developer', 'content': message}]
+        continued['input'] = append_input(items or [], output + [{'role': 'developer', 'content': message}])
         return continued
 
     def _continue_office(self, source, calls, tools, memory, rewriter, output):
@@ -400,7 +508,8 @@ class Handler(BaseHTTPRequestHandler):
         items = continued.get('input')
         if isinstance(items, str):
             items = [{'role': 'user', 'content': items}]
-        items = list(items or [])
+        trigger = items[-1:] if items and items[-1].get('type') == 'compaction_trigger' else []
+        items = list(items[:-1] if trigger else items or [])
         items.extend(output)
         seen = set()
         for call in calls:
@@ -414,10 +523,10 @@ class Handler(BaseHTTPRequestHandler):
                           'output': office_stub(call, tools, rejection.reason if rejection else None)})
             memory.remember(call, turn_id=rewriter.turn_id, iteration=rewriter.iteration)
         items.append({'role': 'developer', 'content': continue_message(tools)})
-        continued['input'] = items
+        continued['input'] = items + trigger
         return continued
 
-    def _json(self, status: int, payload: dict) -> None:
+    def _json(self, status: int, payload: dict, *, headers=None) -> None:
         self.close_connection = True
         body = json.dumps(payload, ensure_ascii=False).encode('utf-8')
         self.send_response(status)
@@ -425,6 +534,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('Content-Length', str(len(body)))
         self.send_header('Connection', 'close')
         self.send_header('Cache-Control', 'no-store')
+        for key, value in (headers or {}).items():
+            self.send_header(key, value)
         self.end_headers()
         self.wfile.write(body)
 
@@ -449,9 +560,18 @@ def _hide_excel_instructions(payload: dict, instructions: str) -> dict:
     return {**payload, 'response': {**response, 'instructions': instructions}}
 
 
-def serve(host: str, port: int, memory: CallMemory) -> None:
-    server = ProxyServer((host, port), memory)
+def serve(host: str, port: int, memory: CallMemory, **limits) -> None:
+    _, catalog_info = catalog_snapshot()
+    source_hash = hashlib.sha256()
+    for file in sorted(Path(__file__).parent.glob('*.py')):
+        source_hash.update(file.name.encode())
+        source_hash.update(file.read_bytes())
+    server = ProxyServer((host, port), memory, **limits)
     log.info('listening on loopback port=%s default_model=%s', port, DEFAULT_MODEL)
+    log.info('service configuration build=%s concurrency=%s max_pending=%s queue_timeout=%s upstream_rps=%s catalog_source=%s catalog_version=%s catalog_sha256=%s',
+             source_hash.hexdigest()[:16], server.admission.limit, server.admission.max_pending,
+             server.admission.timeout, server.upstream_rate.limit, catalog_info['catalog_source'], catalog_info['catalog_client_version'],
+             catalog_info['catalog_sha256'])
     try:
         server.serve_forever()
     except KeyboardInterrupt:

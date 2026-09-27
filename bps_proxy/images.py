@@ -178,7 +178,7 @@ class Pictures:
                 if key[0] == account and value in file_ids:
                     del self._ids[key]
 
-    def _file(self, session, mime: str, data: bytes, sent: Sent, fresh: set[str]) -> str:
+    def _file(self, session, mime: str, data: bytes, sent: Sent, fresh: set[str], before_upload=None) -> str:
         account = getattr(session, 'account_id', '')
         key = (account, hashlib.sha256(data).hexdigest())
         with self._uploads[int(key[1][:2], 16) % len(self._uploads)]:
@@ -190,6 +190,8 @@ class Pictures:
                 if file_id not in fresh:
                     sent.reused.add(file_id)
             else:
+                if before_upload is not None:
+                    before_upload()
                 file_id = upload(session, mime, data, key[1])
                 with self._lock:
                     self._ids[key] = file_id
@@ -200,7 +202,7 @@ class Pictures:
         sent.file_ids.add(file_id)
         return file_id
 
-    def rewrite(self, body: dict, session, *, fresh: set[str] | None = None) -> Sent:
+    def rewrite(self, body: dict, session, *, fresh: set[str] | None = None, before_upload=None) -> Sent:
         sent = Sent(body)
         self._local.last = sent
         items = body.get('input')
@@ -250,7 +252,7 @@ class Pictures:
                     content.append(part)
                 else:
                     mime, data = decoded[url]
-                    file_id = self._file(session, mime, data, sent, fresh)
+                    file_id = self._file(session, mime, data, sent, fresh, before_upload)
                     picture = {key: value for key, value in part.items() if key != 'image_url'}
                     picture.setdefault('detail', 'auto')
                     content.append({**picture, 'file_id': file_id})

@@ -1,10 +1,5 @@
-# 把下面两段贴进 ~/.codex/config.toml
-# model_provider 放在文件顶层，不要放进别的 [table] 里面。
-# 改完重新开一次对话。代理要先启动，默认端口 8787。
+# 把下面一行贴进 ~/.codex/config.toml 顶层，放在所有 [table] 之前。
+# 使用 Codex 内置 openai provider；迁移时删除旧 model_provider 选择和对应的自定义 provider 段。
+# 保存后重启 Codex 并新建对话。代理要先启动，默认端口 8787。
 
-model_provider = "bps"
-
-[model_providers.bps]
-name = "Basispoints"
-base_url = "http://127.0.0.1:8787/v1"
-wire_api = "responses"
+openai_base_url = "http://127.0.0.1:8787/v1"

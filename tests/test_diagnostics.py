@@ -80,18 +80,23 @@ class DiagnosticTests(unittest.TestCase):
                 self.assertIsNone(memory.recall(native["call_id"]))
                 self.assertNotIn("Tokyo", chr(10).join(logs.output))
 
-    def test_luna_route_logs_both_models_and_preserves_actual_response_model(self):
-        event, payload = completed([])
-        payload["response"]["model"] = "gpt-5.6-luna"
-        with self.assertLogs("bps_proxy", "INFO") as logs, patch("bps_proxy.server.load_session", return_value=ChatGPTSession("fake", "account", "", 0)), patch("bps_proxy.server.iter_events", return_value=iter([(event, payload)])) as upstream:
-            status, body = self.send(source={"model": "gpt-6-luna", "stream": False})
-        self.assertEqual(status, 200)
-        self.assertEqual(upstream.call_args.args[1]["model"], "gpt-5.6-luna")
-        self.assertEqual(json.loads(body)["model"], "gpt-5.6-luna")
-        self.assertIn("requested_model=gpt-6-luna model=gpt-5.6-luna", chr(10).join(logs.output))
+    def test_family_routes_log_requested_and_actual_response_models(self):
+        for family in ('sol', 'terra', 'luna'):
+            requested, actual = 'gpt-6-' + family, 'gpt-5.6-' + family
+            event, payload = completed([])
+            payload['response']['model'] = actual
+            with self.subTest(model=requested), self.assertLogs('bps_proxy', 'INFO') as logs, patch(
+                    'bps_proxy.server.load_session', return_value=ChatGPTSession('fake', 'account', '', 0)), patch(
+                    'bps_proxy.server.iter_events', return_value=iter([(event, payload)])) as upstream:
+                status, body = self.send(source={'model': requested, 'stream': False})
+            self.assertEqual(status, 200)
+            self.assertEqual(upstream.call_args.args[1]['model'], actual)
+            self.assertEqual(json.loads(body)['model'], actual)
+            self.assertIn('requested_model=' + requested + ' model=' + actual, chr(10).join(logs.output))
 
     def test_403_is_not_retried_with_another_model(self):
-        for requested, actual in (("gpt-6-luna", "gpt-5.6-luna"), ("gpt-6-astra", "gpt-6-astra")):
+        for requested, actual in (("gpt-6-sol", "gpt-5.6-sol"), ("gpt-6-terra", "gpt-5.6-terra"),
+                                  ("gpt-6-luna", "gpt-5.6-luna"), ("gpt-6-astra", "gpt-6-astra")):
             with self.subTest(model=requested), patch("bps_proxy.server.load_session", return_value=ChatGPTSession("fake", "account", "", 0)), patch("bps_proxy.server.iter_events", side_effect=UpstreamError(403, "denied")) as upstream:
                 status, _ = self.send(source={"model": requested})
                 self.assertEqual(status, 403)

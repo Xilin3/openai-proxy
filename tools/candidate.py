@@ -101,10 +101,8 @@ def stop():
 
 
 def cli_args(port, arguments):
-    return ['codex', '-c', 'model_provider="bps"', '-c',
-            f'model_providers.bps.base_url="http://127.0.0.1:{port}/v1"',
-            '-c', 'model_providers.bps.wire_api="responses"',
-            '-c', 'model_providers.bps.name="Basispoints candidate"', *arguments]
+    return ['codex', '-c', 'model_provider="openai"', '-c',
+            f'openai_base_url="http://127.0.0.1:{port}/v1"', *arguments]
 
 
 def main():

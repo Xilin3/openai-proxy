@@ -5,9 +5,13 @@ from __future__ import annotations
 import argparse
 import ipaddress
 import logging
+import os
 from pathlib import Path
 
-from bps_proxy.server import serve
+from bps_proxy.server import serve, MAX_CONCURRENT_REQUESTS, MAX_PENDING_REQUESTS, QUEUE_TIMEOUT
+from bps_proxy.admission import Admission
+from bps_proxy.rate_limit import RequestRateLimiter, UPSTREAM_REQUESTS_PER_SECOND
+from bps_proxy.catalog import catalog_snapshot
 from bps_proxy.wire import CallMemory, DEFAULT_MODEL
 
 
@@ -17,6 +21,11 @@ def main() -> None:
     )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8787)
+    parser.add_argument('--model-catalog', type=Path, help='使用指定的模型目录文件')
+    parser.add_argument('--max-concurrent', type=int, default=MAX_CONCURRENT_REQUESTS)
+    parser.add_argument('--max-pending', type=int, default=MAX_PENDING_REQUESTS)
+    parser.add_argument('--upstream-rps', type=int, default=UPSTREAM_REQUESTS_PER_SECOND, help='每秒最多发起的上游请求数')
+    parser.add_argument('--queue-timeout', type=float, default=QUEUE_TIMEOUT, help='排队最长等待秒数')
     parser.add_argument(
         "--state",
         type=Path,
@@ -32,27 +41,31 @@ def main() -> None:
         parser.error('--host must be a loopback address or localhost')
     if not 1 <= args.port <= 65535:
         parser.error('--port must be between 1 and 65535')
+    try:
+        Admission(args.max_concurrent, args.max_pending, args.queue_timeout)
+        RequestRateLimiter(args.upstream_rps)
+        if args.model_catalog is not None:
+            os.environ['BPS_MODEL_CATALOG'] = str(args.model_catalog.expanduser().resolve())
+        catalog_snapshot()
+    except ValueError as exc:
+        parser.error(str(exc))
     address = f'[{args.host}]' if ':' in args.host else args.host
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     print(
         "\n".join(
             [
-                f"代理已准备监听 http://{args.host}:{args.port}/v1",
+                f"代理已准备监听 http://{address}:{args.port}/v1",
                 f"默认模型 {DEFAULT_MODEL}。effort 的 max 会映射成 xhigh。",
                 "在 ~/.codex/config.toml 里加上：",
                 "",
-                'model_provider = "bps"',
-                "",
-                "[model_providers.bps]",
-                'name = "Basispoints"',
-                f'base_url = "http://{address}:{args.port}/v1"',
-                'wire_api = "responses"',
+                f'openai_base_url = "http://{address}:{args.port}/v1"',
                 "",
             ]
         ),
         flush=True,
     )
-    serve(args.host, args.port, CallMemory(args.state))
+    serve(args.host, args.port, CallMemory(args.state), max_concurrent=args.max_concurrent,
+          max_pending=args.max_pending, queue_timeout=args.queue_timeout, upstream_rps=args.upstream_rps)
 
 
 if __name__ == "__main__":

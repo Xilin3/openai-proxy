@@ -11,6 +11,7 @@ import tempfile
 from collections import OrderedDict
 from dataclasses import dataclass
 from bps_proxy.schema import matches
+from bps_proxy.catalog import catalog_snapshot
 import threading
 import uuid
 from pathlib import Path
@@ -32,6 +33,8 @@ EFFORT_ALIASES = {
     "none": "low",
 }
 MODEL_ALIASES = {
+    "gpt-6-sol": "gpt-5.6-sol",
+    "gpt-6-terra": "gpt-5.6-terra",
     "gpt-6-luna": "gpt-5.6-luna",
     "gpt-5.6-sol-excel": "gpt-5.6-sol",
     "gpt-5.6-luna-excel": "gpt-5.6-luna",
@@ -68,41 +71,20 @@ def normalize_effort(value: Any) -> str:
 
 
 def model_catalog() -> list[dict]:
-    """Advertise max and ultra so the client can select them.
-
-    The Excel backend has no max tier, so max is sent as xhigh. ultra is sent as-is.
-    """
-    levels = [dict(level) for level in CLIENT_REASONING_LEVELS]
-    catalog = []
-    for model in ("gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-luna", "gpt-5.6-terra"):
-        catalog.append(
-            {
-                "id": model,
-                "slug": model,
-                "object": "model",
-                "owned_by": "basispoints",
-                "display_name": MODEL_DISPLAY_NAMES[model],
-                "default_reasoning_level": "max",
-                "supported_reasoning_levels": levels,
-                "shell_type": "unified_exec",
-                "visibility": "list",
-                "supported_in_api": True,
-                "priority": 1,
-                "support_verbosity": True,
-                "default_verbosity": "low",
-                "apply_patch_tool_type": "freeform",
-                "web_search_tool_type": "text_and_image",
-                "supports_image_detail_original": True,
-                "supports_parallel_tool_calls": True,
-                "context_window": 272000,
-                "max_context_window": 872000,
-                "effective_context_window_percent": 95,
-                "input_modalities": ["text", "image"],
-                "supports_search_tool": True,
-                "tool_mode": "code_mode_only",
-            }
-        )
-    return catalog
+    models, _ = catalog_snapshot()
+    for model in models:
+        model.update({
+            'id': model['slug'], 'object': 'model', 'owned_by': 'basispoints',
+            'base_instructions': model['model_messages']['instructions_template'],
+            'default_reasoning_level': 'max',
+            'supported_reasoning_levels': [dict(level) for level in CLIENT_REASONING_LEVELS],
+            'visibility': 'list', 'supported_in_api': True,
+            'experimental_supported_tools': [],
+            'supports_search_tool': False, 'supports_experimental_context': False,
+            'supports_reasoning_summary_parameter': False, 'default_reasoning_summary': 'none',
+            'auto_compact_token_limit': 200000,
+        })
+    return models
 
 
 def requested_effort(source: dict) -> str | None:
@@ -213,13 +195,15 @@ class CallMemory:
         return self._bind_tools(source, '')
 
     def _bind_tools(self, source: dict, scope: str) -> list[dict]:
-        parsed = iter_client_tools(source.get('tools'))
+        parsed, origin = declared_client_tools(source)
         conversation = scope + conversation_identity(source)
         with self._lock:
-            if "tools" not in source and conversation not in self._tools and code_mode_exec(source):
+            if origin == 'none' and conversation not in self._tools and code_mode_exec(source):
                 parsed = [{"type": "custom", "name": "exec",
                            "description": "Run JavaScript using the client-provided tools namespace.", "parameters": {}}]
-            if parsed:
+            # A Lite catalog is a complete current declaration, including an empty one.
+            # Preserve the older top-level tools=[] continuation convention.
+            if parsed or origin in ('additional_tools', 'mixed'):
                 self._tools[conversation] = parsed
             stored = self._tools.get(conversation, [])
             while len(self._tools) > 32:
@@ -330,6 +314,46 @@ class ScopedMemory:
         return self.parent.output_floor(items, turn_id, self.prefix)
 
 
+def declared_client_tools(source: dict) -> tuple[list[dict], str]:
+    """Read client-owned declarations, never permissions inferred from model output."""
+    groups = []
+    top = 'tools' in source
+    if top:
+        groups.append(source['tools'])
+    lite = False
+    for item in source.get('input', []) if isinstance(source.get('input'), list) else []:
+        if not isinstance(item, dict) or item.get('type') != 'additional_tools':
+            continue
+        if item.get('role') != 'developer':
+            raise ValueError('additional_tools 必须来自 developer')
+        lite = True
+        groups.append(item.get('tools'))
+
+    def validate(items, depth=0):
+        if not isinstance(items, list) or depth > 4:
+            raise ValueError('工具目录格式无效或嵌套过深')
+        for item in items:
+            if not isinstance(item, dict):
+                raise ValueError('工具目录中的每项必须是对象')
+            if item.get('type') == 'namespace':
+                validate(item.get('tools'), depth + 1)
+            elif item.get('type', 'function') in ('function', 'custom'):
+                definition = item.get('function') if isinstance(item.get('function'), dict) else item
+                if not isinstance(definition.get('name'), str) or not definition['name'].strip():
+                    raise ValueError('客户端工具缺少有效名称')
+
+    merged = {}
+    for group in groups:
+        validate(group)
+        for tool in iter_client_tools(group):
+            previous = merged.get(tool['name'])
+            if previous is not None and previous != tool:
+                raise ValueError('客户端工具存在冲突的同名声明')
+            merged[tool['name']] = tool
+    origin = 'mixed' if top and lite else 'additional_tools' if lite else 'top_level' if top else 'none'
+    return list(merged.values()), origin
+
+
 def iter_client_tools(tools: Any, collected: list[dict] | None = None, depth: int = 0) -> list[dict]:
     if collected is None:
         collected = []
@@ -362,6 +386,8 @@ def iter_client_tools(tools: Any, collected: list[dict] | None = None, depth: in
                 "parameters": parameters if isinstance(parameters, dict) else {},
             }
         )
+        if isinstance(tool.get('format'), dict):
+            collected[-1]['format'] = json.loads(json.dumps(tool['format']))
     return collected
 
 
@@ -438,6 +464,10 @@ def protocol_instructions(tools: list[dict]) -> str:
         if tool.get("type") == "custom":
             lines.append('Custom tool. Its code object is {"tool":"%s","input":"raw text"}.' % tool["name"])
             lines.append("Input: required string containing the raw tool input, not an args object.")
+            form = tool.get('format', {})
+            if form.get('type') == 'grammar':
+                lines.append('Input grammar syntax: ' + str(form.get('syntax', '')))
+                lines.append(str(form.get('definition', '')))
             continue
         params = _describe_schema(tool["parameters"])
         if params:
@@ -957,6 +987,9 @@ def translate_input(raw_input: Any, memory: CallMemory) -> list[dict]:
             continue
         item = _strip_private(raw)
         kind = str(item.get('type') or '').strip().lower()
+        if kind == 'additional_tools':
+            # Converted into the single transport catalog by prepare_body.
+            continue
         if kind in ('function_call', 'custom_tool_call'):
             call_id = item.get('call_id')
             if call_id in seen:
@@ -1039,6 +1072,18 @@ def conversation_identity(source: dict) -> str:
     return _conversation_id(_identity_items(source.get('input')), source)
 
 
+def append_input(items: list[dict], extra: list[dict]) -> list[dict]:
+    if items and items[-1].get('type') == 'compaction_trigger':
+        return items[:-1] + extra + items[-1:]
+    return list(items) + extra
+
+
+def is_compaction(source: dict) -> bool:
+    items = source.get('input')
+    return (isinstance(items, list) and bool(items) and isinstance(items[-1], dict)
+            and items[-1].get('type') == 'compaction_trigger')
+
+
 def prepare_body(source: dict, memory: CallMemory, *, identity_source: dict | None = None, bump: bool = False) -> dict:
     identity = identity_source if identity_source is not None else source
     tools = memory.bind_tools(source)
@@ -1052,14 +1097,15 @@ def prepare_body(source: dict, memory: CallMemory, *, identity_source: dict | No
     instructions = source.get('instructions')
     if isinstance(instructions, str) and instructions.strip():
         prologue.append(_message('developer', instructions.strip()))
-    prompt = protocol_instructions(tools)
-    if tools and code_mode_exec(source) and any(tool['name'] == 'exec' and tool['type'] == 'custom' for tool in tools):
-        prompt += "\n" + code_mode_instructions(source)
-    if (source.get('tool_choice') == 'required' or isinstance(source.get('tool_choice'), dict)) and tools:
-        prompt += '\nUse at least one of the available client tools before answering.'
-    if source.get('parallel_tool_calls') is False:
-        prompt += '\nIssue only one client tool call in each response.'
-    prologue.append(_message('developer', prompt))
+    if not is_compaction(source):
+        prompt = protocol_instructions(tools)
+        if tools and code_mode_exec(source) and any(tool['name'] == 'exec' and tool['type'] == 'custom' for tool in tools):
+            prompt += "\n" + code_mode_instructions(source)
+        if (source.get('tool_choice') == 'required' or isinstance(source.get('tool_choice'), dict)) and tools:
+            prompt += '\nUse at least one of the available client tools before answering.'
+        if source.get('parallel_tool_calls') is False:
+            prompt += '\nIssue only one client tool call in each response.'
+        prologue.append(_message('developer', prompt))
     body = {
         'model': upstream_model(source.get('model')), 'model_selection': 'explicit',
         'stream': True, 'store': False, 'input': prologue + history,
@@ -1070,6 +1116,8 @@ def prepare_body(source: dict, memory: CallMemory, *, identity_source: dict | No
     cache_key = source.get('prompt_cache_key')
     if isinstance(cache_key, str) and cache_key.strip():
         body['prompt_cache_key'] = cache_key.strip()
+    if 'context_management' in source:
+        body['context_management'] = source['context_management']
     return body
 
 
