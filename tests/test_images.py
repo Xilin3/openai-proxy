@@ -53,15 +53,54 @@ class ImageTests(unittest.TestCase):
                     self.images.rewrite(body, self.session)
                 uploaded.assert_not_called()
 
-    def test_count_byte_and_pixel_limits(self):
-        with patch('bps_proxy.images.MAX_IMAGES', 1), self.assertRaises(ImageInputError):
-            self.images.rewrite({'input': [{'role': 'user', 'content': [picture(), picture()]}]}, self.session)
+    def test_byte_and_pixel_limits(self):
         with patch('bps_proxy.images.MAX_IMAGE_BYTES', 1), self.assertRaises(ImageInputError):
             self.images.rewrite(self.body, self.session)
         with patch('bps_proxy.images.MAX_REQUEST_IMAGE_BYTES', 1), self.assertRaises(ImageInputError):
             self.images.rewrite(self.body, self.session)
         with patch('bps_proxy.images.MAX_PIXELS', 1), self.assertRaises(ImageInputError):
             self.images.rewrite(self.body, self.session)
+
+    def test_more_than_twenty_images_reach_upstream_intact(self):
+        image_sets = {
+            'inline': [picture((index, 0, 0)) for index in range(21)],
+            'attachments': [{'type': 'input_image', 'file_id': f'file_{index}'} for index in range(21)],
+        }
+        for image_form, images in image_sets.items():
+            for output_type in ('function_call_output', 'custom_tool_call_output'):
+                with self.subTest(image_form=image_form, output_type=output_type):
+                    body = {'input': [
+                        {'role': 'user', 'content': images[:10]},
+                        {'type': output_type, 'call_id': 'call_history', 'output': images[10:20]},
+                        {'role': 'user', 'content': images[20:]},
+                    ]}
+                    original = json.dumps(body)
+                    handler = Handler.__new__(Handler)
+                    handler.server = SimpleNamespace(memory=CallMemory(), pictures=Pictures())
+                    with patch('bps_proxy.server.iter_events', return_value=iter([completed([])])) as upstream, patch('bps_proxy.images.upload') as uploaded:
+                        events = list(handler._iter_relay(body, self.session))
+                    upstream.assert_called_once()
+                    uploaded.assert_not_called()
+                    forwarded = []
+                    for item in upstream.call_args.args[1]['input']:
+                        field = 'output' if item.get('type') in ('function_call_output', 'custom_tool_call_output') else 'content'
+                        forwarded.extend(part for part in item.get(field, [])
+                                         if isinstance(part, dict) and part.get('type') == 'input_image')
+                    self.assertEqual(forwarded, images)
+                    self.assertEqual(events[-1][0], 'response.completed')
+                    self.assertEqual(json.dumps(body), original)
+
+    def test_repeated_images_are_preserved_beyond_twenty(self):
+        body = {'input': [{'role': 'user', 'content': [picture() for _ in range(21)]}]}
+        self.assertEqual(self.images.rewrite(body, self.session).body, body)
+
+    def test_large_image_history_keeps_byte_limit_before_upload(self):
+        body = {'input': [{'role': 'user', 'content': [picture() for _ in range(21)]}]}
+        self.images.refuse_inline('account-a', {'message'})
+        with patch('bps_proxy.images.MAX_REQUEST_IMAGE_BYTES', len(png()) * 20), patch('bps_proxy.images.upload') as uploaded:
+            with self.assertRaisesRegex(ImageInputError, '图片合计超过'):
+                self.images.rewrite(body, self.session)
+        uploaded.assert_not_called()
 
     def test_upload_failure_never_replaces_picture_with_text(self):
         original = json.dumps(self.body)

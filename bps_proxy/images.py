@@ -19,7 +19,6 @@ log = logging.getLogger('bps_proxy')
 CACHE_SIZE = 256
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
 MAX_REQUEST_IMAGE_BYTES = 32 * 1024 * 1024
-MAX_IMAGES = 20
 MAX_PIXELS = 64 * 1024 * 1024
 UPLOAD_RESPONSE_BYTES = 64 * 1024
 PICTURE_RETRY_STATUSES = {400, 422}
@@ -209,7 +208,7 @@ class Pictures:
             return sent
         # Validate the entire request before uploading anything.
         decoded: dict[str, tuple[str, bytes]] = {}
-        count = total = 0
+        total = 0
         for item in items:
             if not isinstance(item, dict):
                 continue
@@ -217,9 +216,6 @@ class Pictures:
             for part in parts if isinstance(parts, list) else []:
                 if not isinstance(part, dict) or part.get('type') != 'input_image':
                     continue
-                count += 1
-                if count > MAX_IMAGES:
-                    raise ImageInputError('每个请求最多包含 20 张图片')
                 url = _data_url(part)
                 if url is not None:
                     if url not in decoded:
