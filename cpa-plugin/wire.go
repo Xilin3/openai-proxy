@@ -22,6 +22,7 @@ type prepared struct {
 	Body     object
 	Tools    map[string]tool
 	Parallel bool
+	Model    string
 }
 
 func message(role, text string) object {
@@ -340,6 +341,7 @@ func prepare(raw []byte, model, scope string) (prepared, error) {
 	if model == "" {
 		model = str(source["model"])
 	}
+	result.Model = model
 	model = upstreamModel(model)
 	valid := false
 	for _, name := range modelNames {

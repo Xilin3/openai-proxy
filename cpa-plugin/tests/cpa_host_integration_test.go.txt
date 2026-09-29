@@ -1,0 +1,165 @@
+//go:build cpa_integration
+
+// Copy this test into CPA's internal/pluginhost directory, then run the
+// TestBPSNativeIntegration test with BPS_PLUGIN_PATH set to the built library.
+package pluginhost
+
+import (
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	_ "github.com/router-for-me/CLIProxyAPI/v8/internal/translator"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	coreexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
+)
+
+type bpsNativeSentinel struct{}
+
+func (*bpsNativeSentinel) Identifier() string { return "codex" }
+func (*bpsNativeSentinel) Execute(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
+	return coreexecutor.Response{}, errors.New("native inference must never be called")
+}
+func (*bpsNativeSentinel) ExecuteStream(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (*coreexecutor.StreamResult, error) {
+	return nil, errors.New("native inference must never be called")
+}
+func (*bpsNativeSentinel) Refresh(_ context.Context, auth *coreauth.Auth) (*coreauth.Auth, error) {
+	return auth, nil
+}
+func (*bpsNativeSentinel) CountTokens(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
+	return coreexecutor.Response{}, errors.New("native inference must never be called")
+}
+func (*bpsNativeSentinel) HttpRequest(context.Context, *coreauth.Auth, *http.Request) (*http.Response, error) {
+	return nil, errors.New("network is forbidden in this test")
+}
+
+func TestBPSNativeIntegration(t *testing.T) {
+	library := os.Getenv("BPS_PLUGIN_PATH")
+	if library == "" {
+		t.Skip("BPS_PLUGIN_PATH is required")
+	}
+	pluginDir := t.TempDir()
+	data, err := os.ReadFile(library)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pluginDir, "bps-excel"+filepath.Ext(library)), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	authDir := t.TempDir()
+	path := filepath.Join(authDir, "native-codex.json")
+	claims := []byte(`{"exp":1,"https://api.openai.com/auth":{"chatgpt_account_id":"synthetic"}}`)
+	raw, _ := json.Marshal(map[string]any{
+		"type": "codex", "account_id": "synthetic",
+		"access_token": "header." + base64.RawURLEncoding.EncodeToString(claims) + ".signature",
+	})
+	if err := os.WriteFile(path, raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	manager := coreauth.NewManager(nil, nil, nil)
+	sentinel := &bpsNativeSentinel{}
+	manager.RegisterExecutor(sentinel)
+	auth := &coreauth.Auth{
+		ID: "native-codex.json", FileName: "native-codex.json", Provider: "codex", Status: coreauth.StatusActive,
+		Attributes: map[string]string{"path": path, "source": path},
+		Metadata:   map[string]any{"type": "codex"},
+	}
+	auth, err = manager.Register(ctx, auth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	host := New()
+	host.SetAuthManager(manager)
+	enabled := true
+	cfg := &config.Config{AuthDir: authDir, Plugins: config.PluginsConfig{
+		Enabled: true, Dir: pluginDir,
+		Configs: map[string]config.PluginInstanceConfig{"bps-excel": {Enabled: &enabled, Priority: 10000}},
+	}}
+	host.ApplyConfig(ctx, cfg)
+	defer host.ShutdownAll()
+	if len(host.RegisteredPlugins()) != 1 || !host.HasModelRouters() {
+		t.Fatal("native plugin did not load")
+	}
+	host.RegisterModels(ctx, registry.GetGlobalRegistry())
+	host.RegisterExecutors(manager, registry.GetGlobalRegistry())
+	if current, ok := manager.Executor("codex"); !ok || current != sentinel {
+		t.Fatal("native Codex refresh executor was replaced")
+	}
+	if host.HasAuthProvider("codex") || host.HasAuthProvider("bps-excel") {
+		t.Fatal("plugin claimed native auth ownership")
+	}
+	if _, handled, err := host.RefreshAuth(ctx, auth); handled || err != nil {
+		t.Fatal("plugin intercepted native refresh", handled, err)
+	}
+	for _, model := range host.ModelsForProvider("bps-excel") {
+		if strings.HasSuffix(model.ID, "-excel") {
+			t.Fatal("renamed model", model.ID)
+		}
+	}
+	for _, model := range []string{"gpt-6-astra", "gpt-6-sol", "unknown-provider-model"} {
+		for _, format := range []string{"openai-response", "openai", "claude", "gemini"} {
+			route, ok := host.RouteModel(ctx, pluginapi.ModelRouteRequest{RequestedModel: model, SourceFormat: format, Body: []byte(`{"input":"hello"}`)})
+			if !ok || route.Target != "bps-excel" || !route.Handled {
+				t.Fatal("route not claimed", model, route, ok)
+			}
+		}
+	}
+	for _, input := range []pluginapi.RequestInterceptRequest{
+		{SourceFormat: "openai-response", ToFormat: "codex", Metadata: map[string]any{"selected_auth_id": "native-codex.json"}},
+		{SourceFormat: "openai-response", ToFormat: "openai-response", Metadata: map[string]any{"selected_auth_id": "native-codex.json"}},
+		{SourceFormat: "unsupported", ToFormat: "unsupported"},
+	} {
+		if resp := host.InterceptRequestAfterAuth(ctx, input); !resp.Terminate {
+			t.Fatal("native fallback not blocked", input)
+		}
+	}
+	req := coreexecutor.Request{Model: "gpt-6-astra", Payload: []byte(`{"model":"gpt-6-astra","input":"hello"}`)}
+	opts := coreexecutor.Options{SourceFormat: translator.FormatOpenAIResponse, ResponseFormat: translator.FormatOpenAIResponse}
+	checkStatus := func(want int) {
+		t.Helper()
+		_, err := host.ExecutePluginExecutor(ctx, "bps-excel", req, opts)
+		var status interface{ StatusCode() int }
+		if !errors.As(err, &status) || status.StatusCode() != want {
+			t.Fatalf("expected HTTP %d, got %v", want, err)
+		}
+	}
+	// An expired synthetic token ensures the real host callback path is exercised
+	// without any upstream HTTP request. It must be read from the existing file.
+	checkStatus(401)
+	for _, format := range []translator.Format{translator.FormatOpenAI, translator.FormatClaude, translator.FormatGemini} {
+		_, err := host.ExecutePluginExecutor(ctx, "bps-excel", req, coreexecutor.Options{SourceFormat: format, ResponseFormat: format})
+		var status interface{ StatusCode() int }
+		if !errors.As(err, &status) || status.StatusCode() != 401 {
+			t.Fatal("translated request did not reach shared credential lookup", format, err)
+		}
+	}
+	after, err := os.ReadFile(path)
+	if err != nil || string(after) != string(raw) {
+		t.Fatal("plugin modified native credential")
+	}
+	// A native file update must be observed immediately, with no token cache.
+	if err := os.WriteFile(path, []byte(`{"type":"codex","disabled":true}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	checkStatus(503)
+	if err := os.WriteFile(path, raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	auth.Disabled = true
+	if _, err := manager.Update(ctx, auth); err != nil {
+		t.Fatal(err)
+	}
+	checkStatus(503)
+	t.Log("PASS: actual CPA native loader, global routing, existing auth callbacks, refresh ownership and fallback guard")
+}

@@ -56,6 +56,12 @@ def main(path):
     errors = []
     stream = bytearray()
     status = 200
+    claims = {"exp": int(time.time()) + 3600, "https://api.openai.com/auth": {"chatgpt_account_id": "mock-account"}}
+    jwt = "header." + base64.urlsafe_b64encode(encode(claims)).decode().rstrip("=") + ".signature"
+    auth = {"type": "codex", "access_token": jwt, "account_id": "mock-account"}
+    auth_entry = {"auth_index": "native-account", "provider": "codex", "status": "active"}
+    auth_available = True
+    seen_tokens = []
 
     @Free
     def host_free(ptr, length):
@@ -69,13 +75,23 @@ def main(path):
             req = json.loads(C.string_at(ptr, length))
             method = method.decode()
             result = {}
-            if method == "host.http.operation_open":
+            if method == "host.auth.list":
+                result = {"files": [auth_entry] if auth_available else []}
+            elif method == "host.auth.get_runtime":
+                assert req["auth_index"] == "native-account"
+                result = {"auth": auth_entry}
+            elif method == "host.auth.get":
+                assert req["auth_index"] == "native-account"
+                result = {"json": auth}
+            elif method == "host.http.operation_open":
                 result = {"operation_id": "operation-1"}
             elif method == "host.http.do_stream":
                 assert req["url"] == "https://bps.openai.com/basispoints/api/responses"
                 body = json.loads(base64.b64decode(req["body"]))
                 assert body["model"] == "gpt-5.6-sol"
                 assert body["reasoning_effort"] == "xhigh"
+                assert req["headers"]["Authorization"] == ["Bearer " + auth["access_token"]]
+                seen_tokens.append(auth["access_token"])
                 response = {
                     "type": "response.completed",
                     "response": {
@@ -141,32 +157,43 @@ def main(path):
     rc, registered = invoke("plugin.register", {"schema_version": 6})
     assert rc == 0 and registered["result"]["capabilities"]["executor"]
     assert registered["result"]["metadata"]["Name"] == "bps-excel"
+    assert registered["result"]["metadata"]["GitHubRepository"]
+    assert registered["result"]["capabilities"]["model_router"]
+    assert not registered["result"]["capabilities"].get("auth_provider", False)
     rc, models = invoke("model.static", {})
     assert rc == 0 and len(models["result"]["Models"]) == 7
-
-    claims = {"exp": int(time.time()) + 3600, "https://api.openai.com/auth": {"chatgpt_account_id": "mock-account"}}
-    jwt = "header." + base64.urlsafe_b64encode(encode(claims)).decode().rstrip("=") + ".signature"
-    auth = {"type": "bps-excel", "tokens": {"access_token": jwt, "account_id": "mock-account"}}
+    assert all(not model["ID"].endswith("-excel") for model in models["result"]["Models"])
+    rc, route = invoke("model.route", {"RequestedModel": "any-model", "SourceFormat": "openai-response"})
+    assert rc == 0 and route["result"]["Handled"] and route["result"]["TargetKind"] == "self"
     rc, parsed = invoke("auth.parse", {"FileName": "mock.json", "RawJSON": b64(encode(auth))})
-    assert rc == 0 and parsed["result"]["Auth"]["Provider"] == "bps-excel"
+    assert rc == 0 and not parsed["result"]["Handled"]
+    rc, guard = invoke("request.intercept_after", {"SourceFormat": "openai-response", "ToFormat": "codex", "Metadata": {"selected_auth_id": "native-account"}})
+    assert rc == 0 and guard["result"]["Terminate"]
     request = {
-        "AuthID": "mock",
-        "Model": "gpt-6-sol-excel",
+        "Model": "gpt-6-sol",
         "Format": "openai-response",
-        "Payload": b64(encode({"model": "gpt-6-sol-excel", "input": "hello", "reasoning": {"effort": "max"}})),
-        "StorageJSON": b64(encode(auth)),
+        "Payload": b64(encode({"model": "gpt-6-sol", "input": "hello", "reasoning": {"effort": "max"}})),
         "host_callback_id": "mock-callback",
     }
     rc, response = invoke("executor.execute", request)
     assert rc == 0, response
     decoded = json.loads(base64.b64decode(response["result"]["Payload"]))
     assert decoded["output"][0]["content"][0]["text"] == "offline ABI smoke OK"
+    assert decoded["model"] == "gpt-6-sol"
+    # Simulate the native CPA refresh process persisting a new token.
+    claims["exp"] += 3600
+    auth["access_token"] = "header." + base64.urlsafe_b64encode(encode(claims)).decode().rstrip("=") + ".signature"
     request["stream_id"] = "client-1"
     rc, response = invoke("executor.execute_stream", request)
     assert rc == 0, response
     assert ended.wait(10), "async stream did not close"
     assert b"response.completed" in b"".join(chunks)
     assert not errors, errors
+    assert seen_tokens[0] != seen_tokens[1], "refreshed native credential was not reread"
+    auth_available = False
+    rc, response = invoke("executor.execute", request)
+    assert rc != 0 and response["error"]["http_status"] == 503
+    auth_available = True
     # Reject upstream auth without turning it into a generic HTTP 500.
     status = 401
     rc, response = invoke("executor.execute", request)
@@ -184,7 +211,7 @@ def main(path):
     assert rc == 0, response
     api.shutdown()
     assert not allocated, "host response buffers leaked"
-    print("PASS: native ABI init/register/models/auth/nonstream/async-stream/HTTP-status/quiesce/reinit/free")
+    print("PASS: native ABI/global-route/plain-models/shared-Codex/refresh-reread/fallback-guard/nonstream/async-stream/HTTP-status/reinit/free")
 
 
 if __name__ == "__main__":

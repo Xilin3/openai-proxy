@@ -13,7 +13,7 @@ import (
 )
 
 func sourceWithTools() object {
-	return object{"model": "gpt-6-sol-excel", "input": "hello", "reasoning": object{"effort": "max"},
+	return object{"model": "gpt-6-sol", "input": "hello", "reasoning": object{"effort": "max"},
 		"tools": []any{object{"type": "function", "name": "echo", "parameters": object{"type": "object", "properties": object{"text": object{"type": "string"}}, "required": []string{"text"}, "additionalProperties": false}},
 			object{"type": "custom", "name": "patch", "description": "Apply a patch"}}}
 }
@@ -32,7 +32,7 @@ func completed(output ...any) string {
 func credential(exp int64) []byte {
 	claims := object{"exp": exp, "https://api.openai.com/auth": object{"chatgpt_account_id": "account-a", "chatgpt_account_user_id": "user-a"}}
 	token := "header." + base64.RawURLEncoding.EncodeToString(mustJSON(claims)) + ".signature"
-	return mustJSON(object{"type": provider, "tokens": object{"access_token": token, "account_id": "stale-account"}})
+	return mustJSON(object{"type": "codex", "tokens": object{"access_token": token, "account_id": "stale-account"}})
 }
 func TestPrepare(t *testing.T) {
 	p, err := prepare(mustJSON(sourceWithTools()), "", "a")
@@ -217,7 +217,7 @@ func TestAuthScopeAndExpiry(t *testing.T) {
 	var unrelated object
 	_ = json.Unmarshal(data, &unrelated)
 	unrelated["type"] = "codex"
-	res, err := parseAuth(mustJSON(object{"Provider": "codex", "RawJSON": mustJSON(unrelated), "FileName": "codex.json"}))
+	res, err := newPlugin(nil).handle("auth.parse", mustJSON(object{"Provider": "codex", "RawJSON": mustJSON(unrelated), "FileName": "codex.json"}))
 	if err != nil || res.(object)["Handled"] != false {
 		t.Fatal("claimed native codex auth")
 	}

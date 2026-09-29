@@ -40,6 +40,12 @@ func (m *mockHost) call(method string, input any, out any) error {
 	m.methods = append(m.methods, method)
 	m.mu.Unlock()
 	switch method {
+	case "host.auth.list":
+		return assign(out, object{"files": []authEntry{{Index: "native-codex", Provider: "codex", Status: "active"}}})
+	case "host.auth.get_runtime":
+		return assign(out, object{"auth": authEntry{Index: "native-codex", Provider: "codex", Status: "active"}})
+	case "host.auth.get":
+		return assign(out, object{"json": json.RawMessage(credential(time.Now().Unix() + 3600))})
 	case "host.http.operation_open":
 		return assign(out, object{"operation_id": "op-1"})
 	case "host.http.do_stream":
@@ -90,8 +96,8 @@ func (m *mockHost) call(method string, input any, out any) error {
 	}
 }
 func executionRequest() executorRequest {
-	return executorRequest{AuthID: "auth-a", Model: "gpt-6-sol-excel", Format: "openai-response",
-		Payload: mustJSON(sourceWithTools()), StorageJSON: credential(time.Now().Unix() + 3600), StreamID: "client-1", CallbackID: "callback-1"}
+	return executorRequest{Model: "gpt-6-sol", Format: "openai-response",
+		Payload: mustJSON(sourceWithTools()), StreamID: "client-1", CallbackID: "callback-1"}
 }
 func TestExecutorNonStreaming(t *testing.T) {
 	host := newMockHost(completed(message("assistant", "hello")))
@@ -102,6 +108,11 @@ func TestExecutorNonStreaming(t *testing.T) {
 	}
 	if !strings.Contains(string(out.(object)["Payload"].([]byte)), "hello") {
 		t.Fatal(out)
+	}
+	var response object
+	_ = json.Unmarshal(out.(object)["Payload"].([]byte), &response)
+	if response["model"] != "gpt-6-sol" {
+		t.Fatal("client model name changed", response["model"])
 	}
 	p.shutdown()
 	if p.active != 0 || len(p.streams) != 0 {

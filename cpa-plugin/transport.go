@@ -178,21 +178,17 @@ func (p *Plugin) execute(req executorRequest, streaming bool) (result any, err e
 	if streaming && req.StreamID == "" {
 		return nil, fail(400, "CPA stream_id is required")
 	}
-	if req.Format != "" && req.Format != "openai-response" {
-		return nil, fail(400, "executor requires openai-response format")
+	if req.Format != "" && req.Format != "openai-response" && req.Format != "codex" {
+		return nil, fail(400, "executor requires Responses or Codex Responses format")
 	}
 	if req.Alt != "" {
 		return nil, fail(501, "alternate execution endpoints are not supported")
 	}
-	auth := req.StorageJSON
-	if len(auth) == 0 {
-		auth = mustJSON(req.AuthMetadata)
-	}
-	sess, err := sessionFromJSON(auth, true)
+	sess, authIndex, err := p.selectSession(req.CallbackID)
 	if err != nil {
 		return nil, err
 	}
-	prep, err := prepare(req.Payload, req.Model, req.AuthID+"/"+sess.account)
+	prep, err := prepare(req.Payload, req.Model, authIndex+"/"+sess.account)
 	if err != nil {
 		return nil, err
 	}
@@ -463,6 +459,7 @@ func rewriteSSE(reader io.Reader, limit int, prep prepared, emit func([]byte) er
 				reordered[j] = item
 			}
 			final = clone(res)
+			final["model"] = prep.Model
 			final["output"] = reordered
 			final["status"] = "completed"
 			payload["response"] = final
@@ -492,6 +489,7 @@ func rewriteSSE(reader io.Reader, limit int, prep prepared, emit func([]byte) er
 		// Intermediate snapshots must not leak executable native Office calls.
 		if res := obj(payload["response"]); res != nil {
 			res = clone(res)
+			res["model"] = prep.Model
 			out := []any{}
 			for _, v := range arr(res["output"]) {
 				if !isCall(obj(v)) {

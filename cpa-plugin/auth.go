@@ -42,7 +42,7 @@ func sessionFromJSON(raw []byte, checkExpiry bool) (session, error) {
 	}
 	exp, _ := claims["exp"].(float64)
 	if checkExpiry && int64(exp) <= time.Now().Unix()+30 {
-		return s, fail(401, "BPS access token expired; reimport a current credential")
+		return s, fail(401, "CPA Codex access token expired; wait for CPA's native refresh or re-login through CPA")
 	}
 	return s, nil
 }
