@@ -1,0 +1,8 @@
+{
+  "type": "bps-excel",
+  "email": "account-label@example.invalid",
+  "tokens": {
+    "access_token": "REPLACE_WITH_CURRENT_ACCESS_TOKEN",
+    "account_id": "REPLACE_WITH_ACCOUNT_ID"
+  }
+}

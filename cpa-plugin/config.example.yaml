@@ -1,0 +1,10 @@
+plugins:
+  enabled: true
+  dir: plugins
+  configs:
+    bps-excel:
+      enabled: true
+      priority: 10
+      max_concurrent: 8
+      max_sse_event_mib: 16
+      timeout_seconds: 900
